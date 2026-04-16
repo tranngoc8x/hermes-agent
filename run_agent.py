@@ -4521,53 +4521,64 @@ class AIAgent:
             collected_output_items: list = []
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
-                    for event in stream:
-                        self._touch_activity("receiving stream response")
-                        if self._interrupt_requested:
-                            break
-                        event_type = getattr(event, "type", "")
-                        # Fire callbacks on text content deltas (suppress during tool calls)
-                        if "output_text.delta" in event_type or event_type == "response.output_text.delta":
-                            delta_text = getattr(event, "delta", "")
-                            if delta_text:
-                                self._codex_streamed_text_parts.append(delta_text)
-                            if delta_text and not has_tool_calls:
-                                if not first_delta_fired:
-                                    first_delta_fired = True
-                                    if on_first_delta:
-                                        try:
-                                            on_first_delta()
-                                        except Exception:
-                                            pass
-                                self._fire_stream_delta(delta_text)
-                        # Track tool calls to suppress text streaming
-                        elif "function_call" in event_type:
-                            has_tool_calls = True
-                        # Fire reasoning callbacks
-                        elif "reasoning" in event_type and "delta" in event_type:
-                            reasoning_text = getattr(event, "delta", "")
-                            if reasoning_text:
-                                self._fire_reasoning_delta(reasoning_text)
-                        # Collect completed output items — some backends
-                        # (chatgpt.com/backend-api/codex) stream valid items
-                        # via response.output_item.done but the SDK's
-                        # get_final_response() returns an empty output list.
-                        elif event_type == "response.output_item.done":
-                            done_item = getattr(event, "item", None)
-                            if done_item is not None:
-                                collected_output_items.append(done_item)
-                        # Log non-completed terminal events for diagnostics
-                        elif event_type in ("response.incomplete", "response.failed"):
-                            resp_obj = getattr(event, "response", None)
-                            status = getattr(resp_obj, "status", None) if resp_obj else None
-                            incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
-                            logger.warning(
-                                "Codex Responses stream received terminal event %s "
-                                "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
-                                event_type, status, incomplete_details,
-                                sum(len(p) for p in self._codex_streamed_text_parts),
-                                self._client_log_context(),
-                            )
+                    try:
+                        for event in stream:
+                            self._touch_activity("receiving stream response")
+                            # Skip None events from malformed SSE responses
+                            if event is None:
+                                continue
+                            if self._interrupt_requested:
+                                break
+                            event_type = getattr(event, "type", "")
+                            # Fire callbacks on text content deltas (suppress during tool calls)
+                            if "output_text.delta" in event_type or event_type == "response.output_text.delta":
+                                delta_text = getattr(event, "delta", "")
+                                if delta_text:
+                                    self._codex_streamed_text_parts.append(delta_text)
+                                if delta_text and not has_tool_calls:
+                                    if not first_delta_fired:
+                                        first_delta_fired = True
+                                        if on_first_delta:
+                                            try:
+                                                on_first_delta()
+                                            except Exception:
+                                                pass
+                                    self._fire_stream_delta(delta_text)
+                            # Track tool calls to suppress text streaming
+                            elif "function_call" in event_type:
+                                has_tool_calls = True
+                            # Fire reasoning callbacks
+                            elif "reasoning" in event_type and "delta" in event_type:
+                                reasoning_text = getattr(event, "delta", "")
+                                if reasoning_text:
+                                    self._fire_reasoning_delta(reasoning_text)
+                            # Collect completed output items — some backends
+                            # (chatgpt.com/backend-api/codex) stream valid items
+                            # via response.output_item.done but the SDK's
+                            # get_final_response() returns an empty output list.
+                            elif event_type == "response.output_item.done":
+                                done_item = getattr(event, "item", None)
+                                if done_item is not None:
+                                    collected_output_items.append(done_item)
+                            # Log non-completed terminal events for diagnostics
+                            elif event_type in ("response.incomplete", "response.failed"):
+                                resp_obj = getattr(event, "response", None)
+                                status = getattr(resp_obj, "status", None) if resp_obj else None
+                                incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
+                                logger.warning(
+                                    "Codex Responses stream received terminal event %s "
+                                    "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
+                                    event_type, status, incomplete_details,
+                                    sum(len(p) for p in self._codex_streamed_text_parts),
+                                    self._client_log_context(),
+                                )
+                    except AttributeError as attr_err:
+                        # OpenAI SDK can raise AttributeError when parsing malformed SSE events
+                        logger.warning(
+                            "Codex stream parsing error (likely malformed SSE from server): %s. %s",
+                            attr_err, self._client_log_context(),
+                        )
+                        # Continue to get_final_response() - may still have partial data
                     final_response = stream.get_final_response()
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
@@ -6823,7 +6834,7 @@ class AIAgent:
                     "id": call_id,
                     "call_id": call_id,
                     "response_item_id": response_item_id,
-                    "type": tool_call.type,
+                    "type": getattr(tool_call, "type", "function"),
                     "function": {
                         "name": tool_call.function.name,
                         "arguments": tool_call.function.arguments
@@ -9361,6 +9372,12 @@ class AIAgent:
                         thinking_spinner = None
                     if self.thinking_callback:
                         self.thinking_callback("")
+                    
+                    # Debug: print full traceback for AttributeError
+                    if isinstance(api_error, AttributeError):
+                        import traceback
+                        print(f"\n{self.log_prefix}🐛 DEBUG AttributeError traceback:")
+                        traceback.print_exc()
 
                     # -----------------------------------------------------------
                     # UnicodeEncodeError recovery.  Two common causes:

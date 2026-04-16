@@ -38,7 +38,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 logger = logging.getLogger("hermes.mcp_serve")
 
@@ -428,7 +428,13 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
+def create_mcp_server(
+    event_bridge: Optional[EventBridge] = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    streamable_http_path: str = "/mcp",
+) -> "FastMCP":
     """Create and return the Hermes MCP server with all tools registered."""
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
@@ -444,6 +450,9 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             "Matrix, and other connected platforms."
         ),
     )
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.streamable_http_path = streamable_http_path
 
     bridge = event_bridge or EventBridge()
 
@@ -833,8 +842,15 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+def run_mcp_server(
+    verbose: bool = False,
+    *,
+    transport: Literal["stdio", "streamable-http"] = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    path: str = "/mcp",
+) -> None:
+    """Start the Hermes MCP server on stdio or Streamable HTTP."""
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -842,6 +858,12 @@ def run_mcp_server(verbose: bool = False) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if transport not in ("stdio", "streamable-http"):
+        raise ValueError(f"Unsupported MCP transport: {transport}")
+
+    if not path.startswith("/"):
+        path = f"/{path}"
 
     if verbose:
         logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
@@ -851,13 +873,27 @@ def run_mcp_server(verbose: bool = False) -> None:
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
+    server = create_mcp_server(
+        event_bridge=bridge,
+        host=host,
+        port=port,
+        streamable_http_path=path,
+    )
 
     import asyncio
 
     async def _run():
         try:
-            await server.run_stdio_async()
+            if transport == "streamable-http":
+                logger.warning(
+                    "Hermes MCP server listening on http://%s:%s%s",
+                    host,
+                    port,
+                    path,
+                )
+                await server.run_streamable_http_async()
+            else:
+                await server.run_stdio_async()
         finally:
             bridge.stop()
 

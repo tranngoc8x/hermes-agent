@@ -5739,6 +5739,28 @@ Examples:
         "-v", "--verbose", action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="MCP transport to serve (default: stdio)",
+    )
+    mcp_serve_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host for streamable-http transport (default: 127.0.0.1)",
+    )
+    mcp_serve_p.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Bind port for streamable-http transport (default: 8000)",
+    )
+    mcp_serve_p.add_argument(
+        "--path",
+        default="/mcp",
+        help="HTTP path for streamable-http transport (default: /mcp)",
+    )
 
     mcp_add_p = mcp_sub.add_parser("add", help="Add an MCP server (discovery-first install)")
     mcp_add_p.add_argument("name", help="Server name (used as config key)")

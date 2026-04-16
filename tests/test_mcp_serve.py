@@ -15,7 +15,7 @@ import sqlite3
 import time
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -834,6 +834,21 @@ class TestServerCreation:
         bridge = mcp_serve.EventBridge()
         assert mcp_serve.create_mcp_server(event_bridge=bridge) is not None
 
+    def test_create_server_applies_streamable_http_settings(self, populated_sessions_dir, monkeypatch):
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        server = mcp_serve.create_mcp_server(
+            host="0.0.0.0",
+            port=9100,
+            streamable_http_path="/custom-mcp",
+        )
+
+        assert server.settings.host == "0.0.0.0"
+        assert server.settings.port == 9100
+        assert server.settings.streamable_http_path == "/custom-mcp"
+
     def test_create_without_mcp_sdk(self, monkeypatch):
         import mcp_serve
         monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", False)
@@ -849,6 +864,64 @@ class TestRunMcpServer:
             mcp_serve.run_mcp_server()
         assert exc_info.value.code == 1
 
+    def test_rejects_unsupported_transport(self):
+        import mcp_serve
+
+        with pytest.raises(ValueError, match="Unsupported MCP transport"):
+            mcp_serve.run_mcp_server(transport="sse")
+
+    def test_run_stdio_transport(self, monkeypatch):
+        import mcp_serve
+
+        bridge = MagicMock()
+        server = MagicMock()
+        server.run_stdio_async = AsyncMock()
+        server.run_streamable_http_async = AsyncMock()
+
+        monkeypatch.setattr(mcp_serve, "EventBridge", MagicMock(return_value=bridge))
+        monkeypatch.setattr(mcp_serve, "create_mcp_server", MagicMock(return_value=server))
+
+        mcp_serve.run_mcp_server(verbose=True)
+
+        bridge.start.assert_called_once_with()
+        mcp_serve.create_mcp_server.assert_called_once_with(
+            event_bridge=bridge,
+            host="127.0.0.1",
+            port=8000,
+            streamable_http_path="/mcp",
+        )
+        server.run_stdio_async.assert_awaited_once_with()
+        server.run_streamable_http_async.assert_not_awaited()
+        bridge.stop.assert_called()
+
+    def test_run_streamable_http_transport_normalizes_path(self, monkeypatch):
+        import mcp_serve
+
+        bridge = MagicMock()
+        server = MagicMock()
+        server.run_stdio_async = AsyncMock()
+        server.run_streamable_http_async = AsyncMock()
+
+        monkeypatch.setattr(mcp_serve, "EventBridge", MagicMock(return_value=bridge))
+        monkeypatch.setattr(mcp_serve, "create_mcp_server", MagicMock(return_value=server))
+
+        mcp_serve.run_mcp_server(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=9100,
+            path="custom-mcp",
+        )
+
+        mcp_serve.create_mcp_server.assert_called_once_with(
+            event_bridge=bridge,
+            host="0.0.0.0",
+            port=9100,
+            streamable_http_path="/custom-mcp",
+        )
+        server.run_streamable_http_async.assert_awaited_once_with()
+        server.run_stdio_async.assert_not_awaited()
+        bridge.stop.assert_called()
+
 
 class TestCliIntegration:
     def test_parse_serve(self):
@@ -859,12 +932,20 @@ class TestCliIntegration:
         mcp_sub = mcp_p.add_subparsers(dest="mcp_action")
         serve_p = mcp_sub.add_parser("serve")
         serve_p.add_argument("-v", "--verbose", action="store_true")
+        serve_p.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
+        serve_p.add_argument("--host", default="127.0.0.1")
+        serve_p.add_argument("--port", type=int, default=8000)
+        serve_p.add_argument("--path", default="/mcp")
 
         args = parser.parse_args(["mcp", "serve"])
         assert args.mcp_action == "serve"
         assert args.verbose is False
+        assert args.transport == "stdio"
+        assert args.host == "127.0.0.1"
+        assert args.port == 8000
+        assert args.path == "/mcp"
 
-    def test_parse_serve_verbose(self):
+    def test_parse_serve_streamable_http_options(self):
         import argparse
         parser = argparse.ArgumentParser()
         subs = parser.add_subparsers(dest="command")
@@ -872,9 +953,23 @@ class TestCliIntegration:
         mcp_sub = mcp_p.add_subparsers(dest="mcp_action")
         serve_p = mcp_sub.add_parser("serve")
         serve_p.add_argument("-v", "--verbose", action="store_true")
+        serve_p.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
+        serve_p.add_argument("--host", default="127.0.0.1")
+        serve_p.add_argument("--port", type=int, default=8000)
+        serve_p.add_argument("--path", default="/mcp")
 
-        args = parser.parse_args(["mcp", "serve", "--verbose"])
+        args = parser.parse_args([
+            "mcp", "serve", "--verbose",
+            "--transport", "streamable-http",
+            "--host", "0.0.0.0",
+            "--port", "9100",
+            "--path", "/custom-mcp",
+        ])
         assert args.verbose is True
+        assert args.transport == "streamable-http"
+        assert args.host == "0.0.0.0"
+        assert args.port == 9100
+        assert args.path == "/custom-mcp"
 
     def test_dispatcher_routes_serve(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -882,10 +977,23 @@ class TestCliIntegration:
         monkeypatch.setattr("mcp_serve.run_mcp_server", mock_run)
 
         import argparse
-        args = argparse.Namespace(mcp_action="serve", verbose=True)
+        args = argparse.Namespace(
+            mcp_action="serve",
+            verbose=True,
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=9100,
+            path="/custom-mcp",
+        )
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
+        mock_run.assert_called_once_with(
+            verbose=True,
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=9100,
+            path="/custom-mcp",
+        )
 
 
 # ---------------------------------------------------------------------------
